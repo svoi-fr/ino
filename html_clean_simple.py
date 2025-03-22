@@ -43,6 +43,12 @@ def clean_html(html_content):
     for tag in soup.find_all(pattern):
         tag.decompose()
     
+    class_pattens = ['cookie', 'banner', 'popup', 'modal', 'ad', 'mapbox']
+
+    pattern = re.compile(r'\b(' + '|'.join(class_pattens) + r')\b')
+    for tag in soup.find_all(class_=pattern):
+        tag.decompose()
+    
     # Remove specific attributes from remaining tags
     for tag in soup.find_all(True):  # Find all remaining tags
         for attr in list(tag.attrs):
