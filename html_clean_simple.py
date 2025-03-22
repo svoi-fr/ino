@@ -3,25 +3,22 @@ import trafilatura
 from lxml import html, etree
 import urllib.parse
 from urllib.parse import urlparse
-from bs4 import BeautifulSoup, Tag, NavigableString, Comment
+from bs4 import BeautifulSoup
 import re
 import difflib
 from inscriptis import get_text
 from inscriptis.model.config import ParserConfig
 
-
-# List of URLs to test
-urls = [
-    'https://qx1.org/lieu/ecm-boutik/',
-    'https://qx1.org/lieu/armee-du-salut-paroisse-de-saint-mauront/',
-    'https://qx1.org/lieu/rusf-reseau-universite-sans-frontieres/',
-]
-
-headers = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-}
-def clean_html(html_content):
-    """Clean HTML by removing specified tags while preserving important content."""
+def pre_parse(html_content):
+    """
+    Pre-process HTML by removing specified tags while preserving important content.
+    
+    Args:
+        html_content (str): The original HTML content
+        
+    Returns:
+        str: Cleaned HTML
+    """
     soup = BeautifulSoup(html_content, 'html.parser')
     
     # Enhanced list of tags to remove
@@ -41,16 +38,6 @@ def clean_html(html_content):
     for tag in soup.find_all(pattern):
         tag.decompose()
     
-    # Remove elements with classes matching patterns for advertisements, popups, etc.
-    class_patterns = ['cookie', 'banner', 'popup', 'modal', 'ad', 'mapbox.*']
-    pattern = re.compile(r'(' + '|'.join(class_patterns) + r')')
-    for tag in soup.find_all(class_=pattern):
-        tag.decompose()
-    
-    # Remove HTML comments
-    for comment in soup.find_all(text=lambda text: isinstance(text, Comment)):
-        comment.extract()
-    
     # Remove specific attributes from remaining tags
     for tag in soup.find_all(True):  # Find all remaining tags
         for attr in list(tag.attrs):
@@ -67,9 +54,22 @@ def clean_html(html_content):
     
     return soup.prettify()
 
-def extract_with_trafilatura(html_content, url):
-    """Extract content using trafilatura."""
-    downloaded = trafilatura.extract(
+def trafilatura_parse(html_content, url):
+    """
+    Parse HTML content using trafilatura in both XML and HTML formats.
+    
+    Args:
+        html_content (str): HTML content to parse
+        url (str): URL of the HTML content
+        
+    Returns:
+        tuple: (trafilatura_xml, trafilatura_html, metadata)
+            - trafilatura_xml (str): Content in XML format
+            - trafilatura_html (str): Content in HTML format
+            - metadata (dict): Metadata extracted by trafilatura
+    """
+    # Extract content in XML format
+    trafilatura_xml = trafilatura.extract(
         html_content,
         url=url,
         include_comments=False,
@@ -78,11 +78,61 @@ def extract_with_trafilatura(html_content, url):
         include_links=True,
         output_format='xml'
     )
-    return downloaded
+    
+    # Extract content in HTML format
+    trafilatura_html = trafilatura.extract(
+        html_content,
+        url=url,
+        include_comments=False,
+        include_tables=True,
+        include_images=False,
+        include_links=True,
+        output_format='html'
+    )
+    
+    metadata = trafilatura.metadata.extract_metadata(
+        html_content,
+        default_url=url,
+        extensive=False
+    )
+    # Convert metadata object to dictionary
+    metadata_dict = {}
+    for key, value in metadata.as_dict().items():
+        if value:
+            metadata_dict[key] = value
+    
+    return trafilatura_xml, trafilatura_html, metadata_dict
+
+def extract_structured_data(original_html, trafilatura_xml):
+    """
+    Extract structured data from HTML content using our custom extractor.
+    
+    Args:
+        original_html (str): Original HTML content
+        trafilatura_xml (str): Content extracted by trafilatura
+        
+    Returns:
+        dict: Structured data dictionary
+    """
+    # Find preserved content that trafilatura might have missed
+    preserved_elements = preserve_important_content(original_html, trafilatura_xml)
+    
+    # Extract structured data
+    contact_info = extract_location_info(preserved_elements)
+    hours_info = extract_hours_info(preserved_elements)
+    
+    # Organize structured data
+    structured_data = {
+        'contact': contact_info,
+        'hours': hours_info,
+        'preserved_elements': preserved_elements
+    }
+    
+    return structured_data
 
 def preserve_important_content(original_html, trafilatura_output):
     """
-    Compare original (pre-cleaned) HTML with trafilatura output to identify
+    Compare original HTML with trafilatura output to identify
     and preserve important content that might have been dropped.
     """
     # Parse both documents
@@ -93,48 +143,19 @@ def preserve_important_content(original_html, trafilatura_output):
     # Find important content in original that might be missing in trafilatura output
     important_elements = []
     
-    # Helper function to get substantial parent container
-    def get_substantial_parent(element, max_levels=2):
-        """
-        Get a meaningful parent container that likely contains related content.
-        Traverses up the DOM tree looking for container elements with multiple children
-        or specific container classes.
-        """
-        # List of class names that typically indicate content containers
-        container_classes = ['container', 'section', 'box', 'card', 'panel', 'widget', 
-                           'article', 'content', 'info', 'details', 'group', 'aside']
-        
+    # Helper function to get parent containers with context
+    def get_parent_with_context(element, max_levels=3):
+        """Get parent element with meaningful context for the given element."""
         current = element
         for _ in range(max_levels):
-            if not current.parent or current.parent.name == 'body':
-                return current
-                
-            parent = current.parent
-            
-            # Check if this parent has a relevant container class
-            has_container_class = False
-            if 'class' in parent.attrs:
-                parent_classes = parent['class'] if isinstance(parent['class'], list) else [parent['class']]
-                has_container_class = any(container in ' '.join(parent_classes).lower() 
-                                         for container in container_classes)
-            
-            # Check if parent contains multiple meaningful children
-            children_count = len([c for c in parent.children 
-                                if isinstance(c, Tag) and c.name not in ['br', 'hr']])
-            
-            # If this parent has multiple children or a container class, consider it substantial
-            if children_count >= 2 or has_container_class:
-                current = parent
-                # If this parent has a header/title element as one of its children,
-                # it's likely a complete content block
-                if any(c.name in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6'] 
-                      for c in parent.find_all(recursive=False)):
+            if current.parent and current.parent.name != 'body' and len(current.parent.get_text(strip=True)) < 500:
+                current = current.parent
+                # If parent has multiple children and seems to be a container, use it
+                if len(list(current.children)) >= 3:
                     return current
             else:
-                # Keep going up if this parent doesn't seem substantial enough
-                current = parent
-                
-        return current  # Return the highest level we reached
+                break
+        return element
     
     # Helper function to check if content is already in trafilatura output
     def is_content_in_trafilatura(content):
@@ -155,373 +176,435 @@ def preserve_important_content(original_html, trafilatura_output):
                 
         return False
     
-    # 1. Look for map links (Google Maps, OpenStreetMap, etc.)
-    map_links = orig_soup.find_all('a', href=lambda h: h and any(term in h.lower() for term in 
-                                ['maps.google', 'google.com/maps', 'openstreetmap', 
-                                 'goo.gl/maps', 'maps.app', '/maps/']))
-    
-    for link in map_links:
-        if not is_content_in_trafilatura(link.get('href')):
-            # Get a substantial parent that likely contains related address info
-            container = get_substantial_parent(link)
-            
-            important_elements.append({
-                'type': 'map',
-                'content': str(container),
-                'text': container.get_text(strip=True),
-                'url': link.get('href')
-            })
-    
-    # 2. Look for address information
-    # First check for explicit address elements
-    address_elements = orig_soup.find_all(['address'])
+    # 1. Look for address information
+    address_elements = orig_soup.find_all(['address', 'div', 'p'], class_=lambda c: c and any(term in (c.lower() if c else '') for term in ['address', 'contact', 'location']))
     for elem in address_elements:
         text_content = elem.get_text(strip=True)
         if text_content and not is_content_in_trafilatura(text_content):
-            container = get_substantial_parent(elem)
+            parent = get_parent_with_context(elem)
             important_elements.append({
                 'type': 'address',
-                'content': str(container),
-                'text': container.get_text(strip=True)
+                'content': str(parent),
+                'text': parent.get_text(strip=True)
             })
     
-    # Then look for elements with address-related classes or IDs
-    address_containers = orig_soup.find_all(['div', 'section', 'article', 'aside'], 
-                                           class_=lambda c: c and any(term in (c.lower() if c else '') 
-                                                                    for term in ['address', 'contact', 'location', 'adresse']))
-    
-    for container in address_containers:
-        text_content = container.get_text(strip=True)
-        if text_content and not is_content_in_trafilatura(text_content):
-            important_elements.append({
-                'type': 'address',
-                'content': str(container),
-                'text': text_content
-            })
-            
-    # Look for elements with address in the ID
-    address_by_id = orig_soup.find_all(id=lambda i: i and any(term in (i.lower() if i else '') 
-                                                           for term in ['address', 'contact', 'location', 'adresse']))
-    for elem in address_by_id:
-        text_content = elem.get_text(strip=True)
-        if text_content and not is_content_in_trafilatura(text_content):
-            container = get_substantial_parent(elem)
-            important_elements.append({
-                'type': 'address',
-                'content': str(container),
-                'text': container.get_text(strip=True)
-            })
-            
-    # 3. Look for headers that might indicate address sections (like "Our Location", "Find Us", etc.)
-    location_headers = orig_soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'], 
-                                        string=lambda s: s and any(term in s.lower() 
-                                                                for term in ['address', 'location', 'contact', 
-                                                                           'find us', 'where to find', 'adresse', 
-                                                                           'où nous trouver']))
-    for header in location_headers:
-        # Get the container that includes this header and its associated content
-        container = get_substantial_parent(header)
-        text_content = container.get_text(strip=True)
-        
-        if text_content and not is_content_in_trafilatura(text_content):
-            important_elements.append({
-                'type': 'address',
-                'content': str(container),
-                'text': text_content
-            })
-    
-    # 4. Look for tel: links
-    phone_links = orig_soup.find_all('a', href=lambda h: h and h.startswith('tel:'))
-    for link in phone_links:
+    # 2. Look for map links (Google Maps, OpenStreetMap, etc.)
+    map_links = orig_soup.find_all('a', href=lambda h: h and any(term in h.lower() for term in ['maps.google', 'openstreetmap', 'goo.gl/maps', 'maps.app', '/maps/']))
+    for link in map_links:
         if not is_content_in_trafilatura(link.get('href')):
-            container = get_substantial_parent(link)
+            parent = get_parent_with_context(link)
             important_elements.append({
-                'type': 'phone',
-                'content': str(container),
-                'text': container.get_text(strip=True),
+                'type': 'map',
+                'content': str(parent),
+                'text': parent.get_text(strip=True),
                 'url': link.get('href')
             })
     
-    # 5. Look for mailto: links
-    email_links = orig_soup.find_all('a', href=lambda h: h and h.startswith('mailto:'))
-    for link in email_links:
+    # 3. Look for tel: and mailto: links
+    contact_links = orig_soup.find_all('a', href=lambda h: h and (h.startswith('tel:') or h.startswith('mailto:')))
+    for link in contact_links:
         if not is_content_in_trafilatura(link.get('href')):
-            container = get_substantial_parent(link)
+            parent = get_parent_with_context(link)
+            link_type = 'phone' if link.get('href', '').startswith('tel:') else 'email'
             important_elements.append({
-                'type': 'email',
-                'content': str(container),
-                'text': container.get_text(strip=True),
+                'type': link_type,
+                'content': str(parent),
+                'text': parent.get_text(strip=True),
                 'url': link.get('href')
             })
     
-    # 6. Look for phone patterns in text even without tel: links
+    # 4. Look for phone patterns in text even without tel: links
     phone_pattern = re.compile(r'(\+\d{1,3}[ -]?)?\(?\d{3}\)?[ -]?\d{3}[ -]?\d{4}')
     for tag in orig_soup.find_all(string=phone_pattern):
         if tag and not is_content_in_trafilatura(tag.strip()):
-            container = get_substantial_parent(tag.parent)
+            parent = get_parent_with_context(tag.parent)
             important_elements.append({
                 'type': 'phone',
-                'content': str(container),
-                'text': container.get_text(strip=True)
+                'content': str(parent),
+                'text': parent.get_text(strip=True)
             })
     
-    # 7. Look for email patterns in text even without mailto: links
+    # 5. Look for email patterns in text even without mailto: links
     email_pattern = re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b')
     for tag in orig_soup.find_all(string=email_pattern):
         if tag and not is_content_in_trafilatura(tag.strip()):
-            container = get_substantial_parent(tag.parent)
+            parent = get_parent_with_context(tag.parent)
             important_elements.append({
                 'type': 'email',
-                'content': str(container),
-                'text': container.get_text(strip=True)
+                'content': str(parent),
+                'text': parent.get_text(strip=True)
             })
     
-    # 8. Look for operating hours
-    # First, try to find containers explicitly about hours
-    hours_elements = orig_soup.find_all(['div', 'section', 'article', 'aside'], 
-                                      class_=lambda c: c and any(term in (c.lower() if c else '') 
-                                                               for term in ['hours', 'schedule', 'opening', 
-                                                                          'horaire', 'opening-hours', 
-                                                                          'business-hours']))
+    # 6. Look for operating hours
+    hours_elements = orig_soup.find_all(['div', 'span', 'p'], class_=lambda c: c and any(term in (c.lower() if c else '') for term in ['hours', 'schedule', 'opening', 'horaire']))
     for elem in hours_elements:
         text_content = elem.get_text(strip=True)
         if text_content and not is_content_in_trafilatura(text_content):
+            parent = get_parent_with_context(elem)
             important_elements.append({
                 'type': 'hours',
-                'content': str(elem),
-                'text': text_content
+                'content': str(parent),
+                'text': parent.get_text(strip=True)
             })
     
-    # Find headings about hours
-    hours_headers = orig_soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'], 
-                                     string=lambda s: s and any(term in s.lower() 
-                                                             for term in ['hours', 'schedule', 'opening', 
-                                                                        'horaire', 'heures d\'ouverture', 
-                                                                        'business hours']))
-    for header in hours_headers:
-        container = get_substantial_parent(header)
-        text_content = container.get_text(strip=True)
-        
-        if text_content and not is_content_in_trafilatura(text_content):
-            important_elements.append({
-                'type': 'hours',
-                'content': str(container),
-                'text': text_content
-            })
-    
-    # 9. Look for elements with time patterns (e.g., 9:00-17:00, 9h-17h)
+    # 7. Look for elements with time patterns (e.g., 9:00-17:00, 9h-17h)
     time_pattern = re.compile(r'(\d{1,2}[h:]\d{2})\s*-\s*(\d{1,2}[h:]\d{2})')
     time_elements = orig_soup.find_all(string=time_pattern)
     for elem in time_elements:
         if elem and not is_content_in_trafilatura(elem.strip()):
             # Check if this is likely part of operating hours (look for days of week nearby)
             days_pattern = re.compile(r'(lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche|monday|tuesday|wednesday|thursday|friday|saturday|sunday)', re.IGNORECASE)
-            container = get_substantial_parent(elem.parent)
-            context = container.get_text()
-            
+            parent = elem.parent
+            context = parent.get_text()
             if days_pattern.search(context):
+                container = get_parent_with_context(parent)
                 important_elements.append({
                     'type': 'hours',
                     'content': str(container),
                     'text': container.get_text(strip=True)
                 })
     
-    # Remove duplicates
+    # Remove duplicates based on text content
     seen_texts = set()
     unique_elements = []
     for item in important_elements:
-        content = item.get('content', '')
-        if content and content not in seen_texts:
-            seen_texts.add(content)
+        text = item.get('text', '')
+        if text and text not in seen_texts:
+            seen_texts.add(text)
             unique_elements.append(item)
     
     return unique_elements
 
-def merge_content(trafilatura_output, preserved_content):
-    """Merge the trafilatura output with preserved content."""
-    if not preserved_content:
-        return trafilatura_output
+def extract_location_info(preserved_content):
+    """
+    Extract and deduplicate location information from preserved content.
+    Returns a dictionary with address, map_url, phone, and email.
+    """
+    location_info = {
+        'address': None,
+        'map_url': None,
+        'phone': None,
+        'email': None
+    }
     
-    soup = BeautifulSoup(trafilatura_output, 'xml')
+    # Extract address
+    address_items = [item for item in preserved_content if item['type'] == 'address']
+    if address_items:
+        # Get the longest address text as it's likely the most complete
+        address_text = max([item.get('text', '').strip() for item in address_items], key=len)
+        # Clean up the address text
+        address_text = re.sub(r'\s+', ' ', address_text)
+        location_info['address'] = address_text
     
-    # Create a new section for preserved content
-    preserved_section = soup.new_tag('div')
-    preserved_section['class'] = 'preserved-content'
+    # Extract map URL
+    map_items = [item for item in preserved_content if item['type'] == 'map']
+    if map_items:
+        # Look for URLs containing latitude and longitude
+        latlong_pattern = re.compile(r'(?:loc:|place\/|@)(-?\d+\.\d+),?\s*(-?\d+\.\d+)')
+        for item in map_items:
+            url = item.get('url', '')
+            if url and latlong_pattern.search(url):
+                location_info['map_url'] = url
+                break
     
-    # Group preserved content by type
-    grouped_content = {}
-    for item in preserved_content:
-        item_type = item['type']
-        if item_type not in grouped_content:
-            grouped_content[item_type] = []
-        grouped_content[item_type].append(item)
-    
-    # For each content type, create a section
-    for content_type, items in grouped_content.items():
-        # Create section for this content type
-        type_section = soup.new_tag('div')
-        type_section['class'] = f'preserved-{content_type}'
-        
-        # Add heading for this section
-        heading = soup.new_tag('h3')
-        heading.string = {
-            'address': 'Location Information',
-            'map': 'Map Links',
-            'phone': 'Phone Contacts',
-            'email': 'Email Contacts',
-            'hours': 'Opening Hours',
-        }.get(content_type, f'Additional {content_type.capitalize()} Information')
-        
-        type_section.append(heading)
-        
-        # Add all items of this type
-        for item in items:
-            item_container = soup.new_tag('div')
-            item_container['class'] = f'{content_type}-item'
+    # Extract phone
+    phone_items = [item for item in preserved_content if item['type'] == 'phone']
+    if phone_items:
+        # Extract phone numbers
+        phone_pattern = re.compile(r'(\+\d{1,3}[ -]?\d{1,3}[ -]?\d{1,3}[ -]?\d{1,4}|\d{2}[ -]?\d{2}[ -]?\d{2}[ -]?\d{2}[ -]?\d{2})')
+        phones = []
+        for item in phone_items:
+            text = item.get('text', '')
+            url = item.get('url', '').replace('tel:', '')
             
-            # If there's a URL (for maps, tel:, mailto:), add it as a link
-            if 'url' in item:
-                url_tag = soup.new_tag('a')
-                url_tag['href'] = item['url']
-                url_display = {
-                    'map': 'View on Map',
-                    'phone': item['url'].replace('tel:', ''),
-                    'email': item['url'].replace('mailto:', '')
-                }.get(content_type, item['url'])
+            # Check text for phone numbers
+            if text:
+                matches = phone_pattern.findall(text)
+                phones.extend(matches)
+            
+            # Add URL if it's a phone number
+            if url and phone_pattern.match(url):
+                phones.append(url)
+        
+        # Deduplicate and get the most complete phone number
+        if phones:
+            # Normalize phone numbers for comparison
+            normalized_phones = [''.join(filter(str.isdigit, phone)) for phone in phones]
+            # Get the longest phone number as the canonical one
+            longest_index = normalized_phones.index(max(normalized_phones, key=len))
+            location_info['phone'] = phones[longest_index]
+    
+    # Extract email
+    email_items = [item for item in preserved_content if item['type'] == 'email']
+    if email_items:
+        # Extract email addresses
+        email_pattern = re.compile(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}')
+        emails = []
+        for item in email_items:
+            text = item.get('text', '')
+            url = item.get('url', '').replace('mailto:', '')
+            
+            # Check text for email
+            if text:
+                matches = email_pattern.findall(text)
+                emails.extend(matches)
+            
+            # Add URL if it's an email
+            if url and email_pattern.match(url):
+                emails.append(url)
+        
+        # Deduplicate emails
+        if emails:
+            location_info['email'] = emails[0]  # Just take the first email
+    
+    return location_info
+
+def extract_hours_info(preserved_content):
+    """
+    Extract and organize hours information from preserved content.
+    Returns a dictionary mapping days to lists of time ranges.
+    """
+    hours_info = {}
+    
+    # Find all hours items
+    hours_items = [item for item in preserved_content if item['type'] == 'hours']
+    
+    if not hours_items:
+        return hours_info
+    
+    # Extract time information
+    day_pattern = re.compile(r'\b(lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b', re.IGNORECASE)
+    time_pattern = re.compile(r'(\d{1,2}[h:]\d{2})\s*-\s*(\d{1,2}[h:]\d{2})')
+    
+    for item in hours_items:
+        text = item.get('text', '')
+        
+        # Find all day mentions
+        day_matches = day_pattern.findall(text.lower())
+        
+        # Find all time ranges
+        time_matches = time_pattern.findall(text)
+        
+        # If we have both days and times, associate them
+        if day_matches and time_matches:
+            for day in day_matches:
+                normalized_day = day.lower()
+                # Map French day names to English if needed
+                day_mapping = {
+                    'lundi': 'monday',
+                    'mardi': 'tuesday',
+                    'mercredi': 'wednesday',
+                    'jeudi': 'thursday',
+                    'vendredi': 'friday',
+                    'samedi': 'saturday',
+                    'dimanche': 'sunday'
+                }
+                normalized_day = day_mapping.get(normalized_day, normalized_day)
                 
-                url_tag.string = url_display
-                item_container.append(url_tag)
-                item_container.append(soup.new_tag('br'))
-            
-            # Parse the HTML content of the item
-            content_html = BeautifulSoup(item['content'], 'html.parser')
-            
-            # Recursively copy the entire structure
-            def copy_element(src, dest):
-                # Skip script, style and empty elements
-                if src.name in ['script', 'style'] or (src.name and not src.get_text(strip=True)):
-                    return
+                # Capitalize the first letter
+                display_day = normalized_day[0].upper() + normalized_day[1:]
                 
-                # If it's a string node (NavigableString)
-                if isinstance(src, NavigableString):
-                    if str(src).strip():  # Only copy non-whitespace strings
-                        dest.append(str(src))
-                    return
+                # Add to hours_info
+                if display_day not in hours_info:
+                    hours_info[display_day] = []
                 
-                # Create a new tag with the same name
-                if src.name:
-                    new_tag = soup.new_tag(src.name)
-                    
-                    # Copy attributes
-                    for attr, value in src.attrs.items():
-                        new_tag[attr] = value
-                    
-                    # Add this tag to the destination
-                    dest.append(new_tag)
-                    
-                    # Copy all child nodes recursively
-                    for child in src.children:
-                        copy_element(child, new_tag)
-            
-            # Copy the content into our item container
-            for child in content_html.children:
-                copy_element(child, item_container)
-            
-            type_section.append(item_container)
-        
-        preserved_section.append(type_section)
+                for time_range in time_matches:
+                    start, end = time_range
+                    time_str = f"{start} - {end}"
+                    if time_str not in hours_info[display_day]:
+                        hours_info[display_day].append(time_str)
     
-    # Find the right place to insert the preserved content
-    body = soup.find('body') or soup.find('text') or soup.find('doc')
-    if body:
-        body.append(preserved_section)
+    return hours_info
+
+def merge_structured_data(content, structured_data, format='xml'):
+    """
+    Merge structured data with content.
+    
+    Args:
+        content (str): Content to merge with (XML or HTML)
+        structured_data (dict): Structured data to merge
+        format (str): Format of the content ('xml' or 'html')
+        
+    Returns:
+        str: Content with structured data merged in
+    """
+    if not structured_data:
+        return content
+    
+    # Parse content based on format
+    if format.lower() == 'xml':
+        soup = BeautifulSoup(content, 'xml')
     else:
-        soup.append(preserved_section)
+        soup = BeautifulSoup(content, 'html.parser')
+    
+    # Find main content section
+    if format.lower() == 'xml':
+        main_section = soup.find('main')
+        if not main_section:
+            main_section = soup.find('body') or soup.find('text')
+            if not main_section:
+                main_section = soup.new_tag('main')
+                soup.append(main_section)
+    else:
+        main_section = soup.find('body')
+        if not main_section:
+            main_section = soup.new_tag('body')
+            soup.append(main_section)
+    
+    # Add contact information
+    contact_info = structured_data.get('contact', {})
+    if any(contact_info.values()):
+        # Add contact header
+        header = soup.new_tag('p')
+        header.string = "Contact Information"
+        main_section.append(header)
+        
+        # Add address
+        if contact_info.get('address'):
+            p = soup.new_tag('p')
+            p.string = contact_info['address']
+            main_section.append(p)
+        
+        # Add map link
+        if contact_info.get('map_url'):
+            p = soup.new_tag('p')
+            p.string = f"Map: {contact_info['map_url']}"
+            main_section.append(p)
+        
+        # Add phone
+        if contact_info.get('phone'):
+            p = soup.new_tag('p')
+            p.string = f"Phone: {contact_info['phone']}"
+            main_section.append(p)
+        
+        # Add email
+        if contact_info.get('email'):
+            p = soup.new_tag('p')
+            p.string = f"Email: {contact_info['email']}"
+            main_section.append(p)
+    
+    # Add hours information
+    hours_info = structured_data.get('hours', {})
+    if hours_info:
+        # Add hours header
+        header = soup.new_tag('p')
+        header.string = "Opening Hours"
+        main_section.append(header)
+        
+        for day, times in hours_info.items():
+            p = soup.new_tag('p')
+            p.string = f"{day}: {', '.join(times)}"
+            main_section.append(p)
     
     return str(soup)
 
+def process_html(url, html_content=None, headers=None):
+    """
+    Process HTML content from a URL or directly provided content.
+    
+    This function implements the complete processing pipeline:
+    1. Pre-process original HTML
+    2. Parse with trafilatura (XML, HTML, metadata)
+    3. Extract structured data
+    4. Merge structured data with content
+    
+    Args:
+        url (str): URL of the HTML content
+        html_content (str, optional): HTML content to process. If None, fetches from URL
+        headers (dict, optional): Headers for HTTP request if fetching from URL
+        
+    Returns:
+        dict: Dictionary containing all processed data
+    """
+    if headers is None:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+    
+    # Fetch HTML content if not provided
+    if html_content is None:
+        try:
+            response = requests.get(url, headers=headers, timeout=30)
+            response.raise_for_status()
+            html_content = response.text
+        except Exception as e:
+            return {
+                'error': f"Error fetching URL: {e}",
+                'success': False
+            }
+    
+    # 1. Pre-process original HTML
+    cleaned_html = pre_parse(html_content)
+    
+    # 2. Parse with trafilatura
+    trafilatura_xml, trafilatura_html, metadata = trafilatura_parse(html_content, url)
+    
+    # If still no content, return error
+    if not trafilatura_xml:
+        return {
+            'error': "Failed to extract content with trafilatura",
+            'success': False
+        }
+    
+    # 3. Extract structured data
+    structured_data = extract_structured_data(html_content, trafilatura_xml)
+    
+    # 4. Merge structured data with content
+    final_xml = merge_structured_data(trafilatura_xml, structured_data, format='xml')
+    final_html = merge_structured_data(trafilatura_html, structured_data, format='html') if trafilatura_html else None
+    # soup = BeautifulSoup(final_html, 'html.parser')
+    # final_html = soup.prettify()
+    
+    # Return all processed data
+    result = {
+        'success': True,
+        'cleaned_html': cleaned_html,
+        'trafilatura_xml': trafilatura_xml,
+        'trafilatura_html': trafilatura_html,
+        'metadata': metadata,
+        'structured_data': structured_data,
+        'final_xml': final_xml,
+        'final_html': final_html
+    }
+    
+    return result
+
 def main():
-    """Main function to process all URLs."""
+    """
+    Simple demonstration of the full processing pipeline.
+    """
+    # Example URLs to test
+    urls = [
+        'https://qx1.org/lieu/ecm-boutik/',
+        'https://qx1.org/lieu/armee-du-salut-paroisse-de-saint-mauront/',
+        'https://qx1.org/lieu/rusf-reseau-universite-sans-frontieres/',
+        'https://refugies.info/dispositif/603fc01d7e319900146336a5'
+    ]
+    
     for url in urls:
         print(f"\n{'='*80}")
         print(f"Processing {url}")
         print(f"{'='*80}")
         
-        # 1. Get original HTML
-        try:
-            response = requests.get(url, headers=headers, timeout=30)
-            response.raise_for_status()  # Raise error for bad status codes
-            original_html = response.text
-        except Exception as e:
-            print(f"Error fetching URL: {e}")
-            continue
+        # Process the URL
+        result = process_html(url)
         
-        # 2. Pre-clean HTML
-        cleaned_html = clean_html(original_html)
-        print("\nPre-cleaned HTML (sample):")
-        print(cleaned_html[:500] + "..." if len(cleaned_html) > 500 else cleaned_html)
-        
-        # 3. Process with trafilatura
-        trafilatura_output = extract_with_trafilatura(cleaned_html, url)
-        print("\nTrafilatura output (sample):")
-        if trafilatura_output:
-            print(trafilatura_output[:500] + "..." if len(trafilatura_output) > 500 else trafilatura_output)
+        if result['success']:
+            # Print summary of results
+            print("\nProcessing successful!")
+            print(f"Metadata: {result['metadata']}")
+            print(f"HTML content:")
+            print(result['final_html'])
+            print(f"Structured data:")
+            print(f"  Contact: {result['structured_data']['contact']}")
+            print(f"  Hours: {result['structured_data']['hours']}")
+            print(f"  Preserved elements: {len(result['structured_data']['preserved_elements'])}")
+            
+            # Save results to files (optional)
+            # ... (save code would go here) ...
         else:
-            print("No content extracted by trafilatura")
-            # Try with original HTML as fallback
-            print("Trying with original HTML as fallback...")
-            trafilatura_output = extract_with_trafilatura(original_html, url)
-            if not trafilatura_output:
-                print("Still no content extracted. Skipping URL.")
-                continue
+            print(f"Error: {result['error']}")
         
-        # 4. Find and preserve important content that trafilatura might have dropped
-        preserved_content = preserve_important_content(cleaned_html, trafilatura_output)
-
-        
-        # Print detailed info about preserved content
-        print(f"\nFound {len(preserved_content)} elements that trafilatura might have dropped:")
-        for i, item in enumerate(preserved_content, 1):
-            print(f"  {i}. {item['type'].upper()}: {item.get('text', '')[:80]}..." if len(item.get('text', '')) > 80 else item.get('text', ''))
-            if 'url' in item:
-                print(f"     URL: {item['url']}")
-        
-        # 5. Merge trafilatura output with preserved content
-        final_output = merge_content(trafilatura_output, preserved_content)
-        print("\nFinal output (sample):")
-        print(final_output)
-        # conf = ParserConfig(display_images=False, display_links=True, display_anchors=False)
-        # text = get_text(final_output)
-        # print(text)
-        # print(final_output[:50000] + "..." if len(final_output) > 500 else final_output)
-        
-        # Save the results to files
-        domain = urlparse(url).netloc
-        path = urlparse(url).path.strip('/').replace('/', '_')
-        filename_base = f"{domain}_{path}" if path else domain
-        
-        try:
-            # Create a 'results' directory if it doesn't exist
-            import os
-            if not os.path.exists('results'):
-                os.makedirs('results')
-                
-            # Save all processing stages
-            with open(f"results/{filename_base}_original.html", "w", encoding='utf-8') as f:
-                f.write(original_html)
-            with open(f"results/{filename_base}_cleaned.html", "w", encoding='utf-8') as f:
-                f.write(cleaned_html)
-            with open(f"results/{filename_base}_trafilatura.xml", "w", encoding='utf-8') as f:
-                f.write(trafilatura_output)
-            with open(f"results/{filename_base}_final.xml", "w", encoding='utf-8') as f:
-                f.write(final_output)
-                
-            print(f"\nResults saved to 'results/{filename_base}_*.html/xml' files")
-            
-        except Exception as e:
-            print(f"Error saving results: {e}")
-            
-        print(f"\nCompleted processing {url}")
         print(f"{'='*80}")
 
 if __name__ == "__main__":
