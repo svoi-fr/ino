@@ -474,7 +474,7 @@ def main():
                 continue
         
         # 4. Find and preserve important content that trafilatura might have dropped
-        preserved_content = preserve_important_content(original_html, trafilatura_output)
+        preserved_content = preserve_important_content(cleaned_html, trafilatura_output)
 
         
         # Print detailed info about preserved content
