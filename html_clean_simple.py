@@ -3,7 +3,7 @@ import trafilatura
 from lxml import html, etree
 import urllib.parse
 from urllib.parse import urlparse
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag, NavigableString
 import re
 import difflib
 from inscriptis import get_text
@@ -85,19 +85,48 @@ def preserve_important_content(original_html, trafilatura_output):
     # Find important content in original that might be missing in trafilatura output
     important_elements = []
     
-    # Helper function to get parent containers with context
-    def get_parent_with_context(element, max_levels=3):
-        """Get parent element with meaningful context for the given element."""
+    # Helper function to get substantial parent container
+    def get_substantial_parent(element, max_levels=2):
+        """
+        Get a meaningful parent container that likely contains related content.
+        Traverses up the DOM tree looking for container elements with multiple children
+        or specific container classes.
+        """
+        # List of class names that typically indicate content containers
+        container_classes = ['container', 'section', 'box', 'card', 'panel', 'widget', 
+                           'article', 'content', 'info', 'details', 'group', 'aside']
+        
         current = element
         for _ in range(max_levels):
-            if current.parent and current.parent.name != 'body' and len(current.parent.get_text(strip=True)) < 500:
-                current = current.parent
-                # If parent has multiple children and seems to be a container, use it
-                if len(list(current.children)) >= 3:
+            if not current.parent or current.parent.name == 'body':
+                return current
+                
+            parent = current.parent
+            
+            # Check if this parent has a relevant container class
+            has_container_class = False
+            if 'class' in parent.attrs:
+                parent_classes = parent['class'] if isinstance(parent['class'], list) else [parent['class']]
+                has_container_class = any(container in ' '.join(parent_classes).lower() 
+                                         for container in container_classes)
+            
+            # Check if parent contains multiple meaningful children
+            children_count = len([c for c in parent.children 
+                                if isinstance(c, Tag) and c.name not in ['br', 'hr']])
+            
+            # If this parent has multiple children or a container class, consider it substantial
+            if children_count >= 2 or has_container_class:
+                current = parent
+                # If this parent has a header/title element as one of its children,
+                # it's likely a complete content block
+                if any(c.name in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6'] 
+                      for c in parent.find_all(recursive=False)):
                     return current
             else:
-                break
-        return element
+                # Keep going up if this parent doesn't seem substantial enough
+                current = parent
+                
+        return current  # Return the highest level we reached
     
     # Helper function to check if content is already in trafilatura output
     def is_content_in_trafilatura(content):
@@ -118,101 +147,184 @@ def preserve_important_content(original_html, trafilatura_output):
                 
         return False
     
-    # 1. Look for address information
-    address_elements = orig_soup.find_all(['address', 'div', 'p'], class_=lambda c: c and any(term in (c.lower() if c else '') for term in ['address', 'contact', 'location']))
+    # 1. Look for map links (Google Maps, OpenStreetMap, etc.)
+    map_links = orig_soup.find_all('a', href=lambda h: h and any(term in h.lower() for term in 
+                                ['maps.google', 'google.com/maps', 'openstreetmap', 
+                                 'goo.gl/maps', 'maps.app', '/maps/']))
+    
+    for link in map_links:
+        if not is_content_in_trafilatura(link.get('href')):
+            # Get a substantial parent that likely contains related address info
+            container = get_substantial_parent(link)
+            
+            important_elements.append({
+                'type': 'map',
+                'content': str(container),
+                'text': container.get_text(strip=True),
+                'url': link.get('href')
+            })
+    
+    # 2. Look for address information
+    # First check for explicit address elements
+    address_elements = orig_soup.find_all(['address'])
     for elem in address_elements:
         text_content = elem.get_text(strip=True)
         if text_content and not is_content_in_trafilatura(text_content):
-            parent = get_parent_with_context(elem)
+            container = get_substantial_parent(elem)
             important_elements.append({
                 'type': 'address',
-                'content': str(parent),
-                'text': parent.get_text(strip=True)
+                'content': str(container),
+                'text': container.get_text(strip=True)
             })
     
-    # 2. Look for map links (Google Maps, OpenStreetMap, etc.)
-    map_links = orig_soup.find_all('a', href=lambda h: h and any(term in h.lower() for term in ['maps.google', 'openstreetmap', 'goo.gl/maps', 'maps.app', '/maps/']))
-    for link in map_links:
-        if not is_content_in_trafilatura(link.get('href')):
-            parent = get_parent_with_context(link)
+    # Then look for elements with address-related classes or IDs
+    address_containers = orig_soup.find_all(['div', 'section', 'article', 'aside'], 
+                                           class_=lambda c: c and any(term in (c.lower() if c else '') 
+                                                                    for term in ['address', 'contact', 'location', 'adresse']))
+    
+    for container in address_containers:
+        text_content = container.get_text(strip=True)
+        if text_content and not is_content_in_trafilatura(text_content):
             important_elements.append({
-                'type': 'map',
-                'content': str(parent),
-                'text': parent.get_text(strip=True),
+                'type': 'address',
+                'content': str(container),
+                'text': text_content
+            })
+            
+    # Look for elements with address in the ID
+    address_by_id = orig_soup.find_all(id=lambda i: i and any(term in (i.lower() if i else '') 
+                                                           for term in ['address', 'contact', 'location', 'adresse']))
+    for elem in address_by_id:
+        text_content = elem.get_text(strip=True)
+        if text_content and not is_content_in_trafilatura(text_content):
+            container = get_substantial_parent(elem)
+            important_elements.append({
+                'type': 'address',
+                'content': str(container),
+                'text': container.get_text(strip=True)
+            })
+            
+    # 3. Look for headers that might indicate address sections (like "Our Location", "Find Us", etc.)
+    location_headers = orig_soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'], 
+                                        string=lambda s: s and any(term in s.lower() 
+                                                                for term in ['address', 'location', 'contact', 
+                                                                           'find us', 'where to find', 'adresse', 
+                                                                           'où nous trouver']))
+    for header in location_headers:
+        # Get the container that includes this header and its associated content
+        container = get_substantial_parent(header)
+        text_content = container.get_text(strip=True)
+        
+        if text_content and not is_content_in_trafilatura(text_content):
+            important_elements.append({
+                'type': 'address',
+                'content': str(container),
+                'text': text_content
+            })
+    
+    # 4. Look for tel: links
+    phone_links = orig_soup.find_all('a', href=lambda h: h and h.startswith('tel:'))
+    for link in phone_links:
+        if not is_content_in_trafilatura(link.get('href')):
+            container = get_substantial_parent(link)
+            important_elements.append({
+                'type': 'phone',
+                'content': str(container),
+                'text': container.get_text(strip=True),
                 'url': link.get('href')
             })
     
-    # 3. Look for tel: and mailto: links
-    contact_links = orig_soup.find_all('a', href=lambda h: h and (h.startswith('tel:') or h.startswith('mailto:')))
-    for link in contact_links:
+    # 5. Look for mailto: links
+    email_links = orig_soup.find_all('a', href=lambda h: h and h.startswith('mailto:'))
+    for link in email_links:
         if not is_content_in_trafilatura(link.get('href')):
-            parent = get_parent_with_context(link)
-            link_type = 'phone' if link.get('href', '').startswith('tel:') else 'email'
+            container = get_substantial_parent(link)
             important_elements.append({
-                'type': link_type,
-                'content': str(parent),
-                'text': parent.get_text(strip=True),
+                'type': 'email',
+                'content': str(container),
+                'text': container.get_text(strip=True),
                 'url': link.get('href')
             })
     
-    # 4. Look for phone patterns in text even without tel: links
+    # 6. Look for phone patterns in text even without tel: links
     phone_pattern = re.compile(r'(\+\d{1,3}[ -]?)?\(?\d{3}\)?[ -]?\d{3}[ -]?\d{4}')
     for tag in orig_soup.find_all(string=phone_pattern):
         if tag and not is_content_in_trafilatura(tag.strip()):
-            parent = get_parent_with_context(tag.parent)
+            container = get_substantial_parent(tag.parent)
             important_elements.append({
                 'type': 'phone',
-                'content': str(parent),
-                'text': parent.get_text(strip=True)
+                'content': str(container),
+                'text': container.get_text(strip=True)
             })
     
-    # 5. Look for email patterns in text even without mailto: links
+    # 7. Look for email patterns in text even without mailto: links
     email_pattern = re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b')
     for tag in orig_soup.find_all(string=email_pattern):
         if tag and not is_content_in_trafilatura(tag.strip()):
-            parent = get_parent_with_context(tag.parent)
+            container = get_substantial_parent(tag.parent)
             important_elements.append({
                 'type': 'email',
-                'content': str(parent),
-                'text': parent.get_text(strip=True)
+                'content': str(container),
+                'text': container.get_text(strip=True)
             })
     
-    # 6. Look for operating hours
-    hours_elements = orig_soup.find_all(['div', 'span', 'p'], class_=lambda c: c and any(term in (c.lower() if c else '') for term in ['hours', 'schedule', 'opening', 'horaire']))
+    # 8. Look for operating hours
+    # First, try to find containers explicitly about hours
+    hours_elements = orig_soup.find_all(['div', 'section', 'article', 'aside'], 
+                                      class_=lambda c: c and any(term in (c.lower() if c else '') 
+                                                               for term in ['hours', 'schedule', 'opening', 
+                                                                          'horaire', 'opening-hours', 
+                                                                          'business-hours']))
     for elem in hours_elements:
         text_content = elem.get_text(strip=True)
         if text_content and not is_content_in_trafilatura(text_content):
-            parent = get_parent_with_context(elem)
             important_elements.append({
                 'type': 'hours',
-                'content': str(parent),
-                'text': parent.get_text(strip=True)
+                'content': str(elem),
+                'text': text_content
             })
     
-    # 7. Look for elements with time patterns (e.g., 9:00-17:00, 9h-17h)
+    # Find headings about hours
+    hours_headers = orig_soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'], 
+                                     string=lambda s: s and any(term in s.lower() 
+                                                             for term in ['hours', 'schedule', 'opening', 
+                                                                        'horaire', 'heures d\'ouverture', 
+                                                                        'business hours']))
+    for header in hours_headers:
+        container = get_substantial_parent(header)
+        text_content = container.get_text(strip=True)
+        
+        if text_content and not is_content_in_trafilatura(text_content):
+            important_elements.append({
+                'type': 'hours',
+                'content': str(container),
+                'text': text_content
+            })
+    
+    # 9. Look for elements with time patterns (e.g., 9:00-17:00, 9h-17h)
     time_pattern = re.compile(r'(\d{1,2}[h:]\d{2})\s*-\s*(\d{1,2}[h:]\d{2})')
     time_elements = orig_soup.find_all(string=time_pattern)
     for elem in time_elements:
         if elem and not is_content_in_trafilatura(elem.strip()):
             # Check if this is likely part of operating hours (look for days of week nearby)
             days_pattern = re.compile(r'(lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche|monday|tuesday|wednesday|thursday|friday|saturday|sunday)', re.IGNORECASE)
-            parent = elem.parent
-            context = parent.get_text()
+            container = get_substantial_parent(elem.parent)
+            context = container.get_text()
+            
             if days_pattern.search(context):
-                container = get_parent_with_context(parent)
                 important_elements.append({
                     'type': 'hours',
                     'content': str(container),
                     'text': container.get_text(strip=True)
                 })
     
-    # Remove duplicates based on text content
+    # Remove duplicates
     seen_texts = set()
     unique_elements = []
     for item in important_elements:
-        text = item.get('text', '')
-        if text and text not in seen_texts:
-            seen_texts.add(text)
+        content = item.get('content', '')
+        if content and content not in seen_texts:
+            seen_texts.add(content)
             unique_elements.append(item)
     
     return unique_elements
@@ -236,17 +348,7 @@ def merge_content(trafilatura_output, preserved_content):
             grouped_content[item_type] = []
         grouped_content[item_type].append(item)
     
-    # Function to safely parse HTML content
-    def safe_parse(html_content):
-        try:
-            return BeautifulSoup(html_content, 'html.parser')
-        except Exception as e:
-            # If parsing fails, create a simple paragraph with text content
-            fallback = soup.new_tag('p')
-            fallback.string = html_content if isinstance(html_content, str) else str(html_content)
-            return fallback
-    
-    # Add preserved content organized by type
+    # For each content type, create a section
     for content_type, items in grouped_content.items():
         # Create section for this content type
         type_section = soup.new_tag('div')
@@ -266,10 +368,10 @@ def merge_content(trafilatura_output, preserved_content):
         
         # Add all items of this type
         for item in items:
-            container = soup.new_tag('div')
-            container['class'] = f'{content_type}-item'
+            item_container = soup.new_tag('div')
+            item_container['class'] = f'{content_type}-item'
             
-            # If there's a URL (for maps, tel:, mailto:), preserve it specifically
+            # If there's a URL (for maps, tel:, mailto:), add it as a link
             if 'url' in item:
                 url_tag = soup.new_tag('a')
                 url_tag['href'] = item['url']
@@ -280,41 +382,49 @@ def merge_content(trafilatura_output, preserved_content):
                 }.get(content_type, item['url'])
                 
                 url_tag.string = url_display
-                container.append(url_tag)
+                item_container.append(url_tag)
+                item_container.append(soup.new_tag('br'))
+            
+            # Parse the HTML content of the item
+            content_html = BeautifulSoup(item['content'], 'html.parser')
+            
+            # Recursively copy the entire structure
+            def copy_element(src, dest):
+                # Skip script, style and empty elements
+                if src.name in ['script', 'style'] or (src.name and not src.get_text(strip=True)):
+                    return
                 
-                # Add a line break
-                container.append(soup.new_tag('br'))
-            
-            # Parse and add the HTML content
-            content_html = safe_parse(item['content'])
-            
-            # Import the content nodes into the soup document
-            for child in content_html.contents:
-                if hasattr(child, 'name'):  # Check if it's a tag, not just a string
-                    imported = soup.new_tag(child.name)
+                # If it's a string node (NavigableString)
+                if isinstance(src, NavigableString):
+                    if str(src).strip():  # Only copy non-whitespace strings
+                        dest.append(str(src))
+                    return
+                
+                # Create a new tag with the same name
+                if src.name:
+                    new_tag = soup.new_tag(src.name)
+                    
                     # Copy attributes
-                    for attr, value in child.attrs.items():
-                        imported[attr] = value
-                    # Set content
-                    if child.string:
-                        imported.string = child.string
-                    else:
-                        # Recursively handle children
-                        for grandchild in child.contents:
-                            if isinstance(grandchild, str):
-                                imported.append(grandchild)
-                            else:
-                                pass  # Skip nested tags for simplicity
-                    container.append(imported)
-                elif str(child).strip():  # If it's a non-empty string
-                    container.append(str(child))
+                    for attr, value in src.attrs.items():
+                        new_tag[attr] = value
+                    
+                    # Add this tag to the destination
+                    dest.append(new_tag)
+                    
+                    # Copy all child nodes recursively
+                    for child in src.children:
+                        copy_element(child, new_tag)
             
-            type_section.append(container)
+            # Copy the content into our item container
+            for child in content_html.children:
+                copy_element(child, item_container)
+            
+            type_section.append(item_container)
         
         preserved_section.append(type_section)
     
     # Find the right place to insert the preserved content
-    body = soup.find('body') or soup.find('text')
+    body = soup.find('body') or soup.find('text') or soup.find('doc')
     if body:
         body.append(preserved_section)
     else:
