@@ -3,7 +3,7 @@ import trafilatura
 from lxml import html, etree
 import urllib.parse
 from urllib.parse import urlparse
-from bs4 import BeautifulSoup, Tag, NavigableString
+from bs4 import BeautifulSoup, Tag, NavigableString, Comment
 import re
 import difflib
 from inscriptis import get_text
@@ -20,8 +20,6 @@ urls = [
 headers = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
 }
-
-# Expanded list of tags to remove
 def clean_html(html_content):
     """Clean HTML by removing specified tags while preserving important content."""
     soup = BeautifulSoup(html_content, 'html.parser')
@@ -43,11 +41,15 @@ def clean_html(html_content):
     for tag in soup.find_all(pattern):
         tag.decompose()
     
-    class_pattens = ['cookie', 'banner', 'popup', 'modal', 'ad', 'mapbox']
-
-    pattern = re.compile(r'\b(' + '|'.join(class_pattens) + r')\b')
+    # Remove elements with classes matching patterns for advertisements, popups, etc.
+    class_patterns = ['cookie', 'banner', 'popup', 'modal', 'ad', 'mapbox.*']
+    pattern = re.compile(r'(' + '|'.join(class_patterns) + r')')
     for tag in soup.find_all(class_=pattern):
         tag.decompose()
+    
+    # Remove HTML comments
+    for comment in soup.find_all(text=lambda text: isinstance(text, Comment)):
+        comment.extract()
     
     # Remove specific attributes from remaining tags
     for tag in soup.find_all(True):  # Find all remaining tags
