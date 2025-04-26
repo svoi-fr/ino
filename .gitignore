@@ -169,3 +169,39 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Sensitive files and credentials
+*.session
+*.session-journal
+*_api_key.txt
+credentials.json
+secrets.json
+
+# Docker volumes and containers
+volumes/
+data/
+milvus/
+mongodb/
+
+# Project specific directories
+slop/
+slop2/
+telegram_export/
+telegram_export_v2/
+extraction_results/
+*_ner_model/
+temp_sort/
+temp/
+tmp/
+
+# System files
+.DS_Store
+
+# JSONs (except examples and templates)
+*.json
+!example.json
+!template.json
+!schema.json
+
+# Misc
+CLAUDE.md

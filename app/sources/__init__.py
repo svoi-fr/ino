@@ -1,0 +1,1 @@
+# Data source adapters for fetching content from various platforms
